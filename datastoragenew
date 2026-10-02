@@ -1,0 +1,335 @@
+#include <stdio.h>
+#include <windows.h>
+#include <conio.h>
+
+#define COM_PORT "\\\\.\\COM3"
+#define BAUD_RATE CBR_115200
+#define G 9.82
+
+int main(void)
+{
+    HANDLE serial;
+    DCB settings = {0};
+    COMMTIMEOUTS timeouts = {0};
+
+    char buffer[256];
+    char line[256];
+    int linePos = 0;
+
+    DWORD bytesRead;
+
+    unsigned int time_ms;
+
+    double ax, ay, az;
+    double gx, gy, gz;
+    double a_total;
+
+    /* =========================================================
+       DATA FILE
+       ========================================================= */
+
+    char filename[] = "measurements.txt";
+
+    /*
+        "w" means measurements.txt is overwritten
+        every time the program starts.
+    */
+
+    FILE *file = fopen(filename, "w");
+
+    if (file == NULL)
+    {
+        printf("Could not create data file.\n");
+        return 1;
+    }
+
+    /* =========================================================
+       OPEN COM PORT
+       ========================================================= */
+
+    serial = CreateFileA(
+        COM_PORT,
+        GENERIC_READ,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+
+    if (serial == INVALID_HANDLE_VALUE)
+    {
+        printf("Could not open %s\n", COM_PORT);
+        fclose(file);
+        return 1;
+    }
+
+    /* =========================================================
+       SERIAL SETTINGS
+       ========================================================= */
+
+    settings.DCBlength = sizeof(settings);
+
+    GetCommState(serial, &settings);
+
+    settings.BaudRate = BAUD_RATE;
+    settings.ByteSize = 8;
+    settings.StopBits = ONESTOPBIT;
+    settings.Parity = NOPARITY;
+
+    SetCommState(serial, &settings);
+
+    /* Short timeout so Q can still be detected */
+
+    timeouts.ReadIntervalTimeout = 10;
+    timeouts.ReadTotalTimeoutConstant = 10;
+    timeouts.ReadTotalTimeoutMultiplier = 0;
+
+    SetCommTimeouts(serial, &timeouts);
+
+    /* =========================================================
+       LET COM PORT SETTLE
+       ========================================================= */
+
+    printf("\nCOM port opened.\n");
+    printf("Waiting for serial connection to stabilise...\n");
+
+    /*
+        Wait 2 seconds after opening the COM port.
+
+        The XIAO continues running during this time,
+        but the PC does not record the incoming data.
+    */
+
+    Sleep(2000);
+
+    /*
+        Throw away everything that arrived during
+        those first 2 seconds.
+    */
+
+    PurgeComm(serial, PURGE_RXCLEAR);
+
+    /*
+        Make sure we don't have part of an old
+        serial line stored.
+    */
+
+    linePos = 0;
+
+    printf("Serial connection ready.\n");
+
+    /* =========================================================
+       START RECORDING
+       ========================================================= */
+
+    printf("\nRecording IMU data...\n");
+    printf("Saving to: %s\n", filename);
+    printf("Press Q to stop.\n\n");
+
+    /* =========================================================
+       RECORD DATA
+       ========================================================= */
+
+    while (1)
+    {
+        /* Check if Q has been pressed */
+
+        if (kbhit())
+        {
+            char key = getch();
+
+            if (key == 'q' || key == 'Q')
+            {
+                break;
+            }
+        }
+
+        /* Read data from COM port */
+
+        if (ReadFile(
+                serial,
+                buffer,
+                sizeof(buffer),
+                &bytesRead,
+                NULL))
+        {
+            for (DWORD i = 0; i < bytesRead; i++)
+            {
+                char c = buffer[i];
+
+                if (c == '\r')
+                {
+                    continue;
+                }
+
+                /*
+                    Build one complete line of data.
+                */
+
+                if (c != '\n')
+                {
+                    if (linePos < sizeof(line) - 1)
+                    {
+                        line[linePos++] = c;
+                    }
+                }
+                else
+                {
+                    line[linePos] = '\0';
+
+                    /*
+                        Expected data from XIAO:
+
+                        time;
+                        ax;
+                        ay;
+                        az;
+                        gx;
+                        gy;
+                        gz;
+                        a_total
+                    */
+
+                    int values = sscanf(
+                        line,
+                        "%u;%lf;%lf;%lf;%lf;%lf;%lf;%lf",
+                        &time_ms,
+                        &ax,
+                        &ay,
+                        &az,
+                        &gx,
+                        &gy,
+                        &gz,
+                        &a_total
+                    );
+
+                    if (values == 8)
+                    {
+                        /*
+                            Convert milliseconds to seconds.
+
+                            We keep the XIAO's actual timestamp.
+                        */
+
+                        double time_seconds =
+                            time_ms / 1000.0;
+
+                        /*
+                            Save:
+
+                            column 1 = time
+                            column 2 = X
+                            column 3 = Y
+                            column 4 = Z
+                            column 5 = total acceleration
+
+                            Acceleration converted to g.
+                        */
+
+                        fprintf(
+                            file,
+                            "%.3f %.3f %.3f %.3f %.3f\n",
+                            time_seconds,
+                            ax / G,
+                            ay / G,
+                            az / G,
+                            a_total / G
+                        );
+
+                        /*
+                            Live terminal display.
+                        */
+
+                        printf(
+                            "\rTime: %.2f s   Total: %.2f g   ",
+                            time_seconds,
+                            a_total / G
+                        );
+                    }
+
+                    /*
+                        Ready to receive the next line.
+                    */
+
+                    linePos = 0;
+                }
+            }
+        }
+    }
+
+    /* =========================================================
+       FINISH RECORDING
+       ========================================================= */
+
+    fclose(file);
+    CloseHandle(serial);
+
+    printf("\n\nRecording stopped.");
+    printf("\nSaved as: %s\n", filename);
+
+    /* =========================================================
+       GNUPLOT
+       ========================================================= */
+
+    FILE *gnuplot = _popen("gnuplot -persistent", "w");
+
+    if (gnuplot == NULL)
+    {
+        printf("Could not start Gnuplot.\n");
+        return 1;
+    }
+
+    /* Graph title */
+
+    fprintf(
+        gnuplot,
+        "set title 'Total Acceleration'\n"
+    );
+
+    /* X axis */
+
+    fprintf(
+        gnuplot,
+        "set xlabel 'Time (seconds)'\n"
+    );
+
+    /* Y axis */
+
+    fprintf(
+        gnuplot,
+        "set ylabel 'Acceleration (g)'\n"
+    );
+
+    /* Grid */
+
+    fprintf(
+        gnuplot,
+        "set grid\n"
+    );
+
+    /* No legend needed because there is only one line */
+
+    fprintf(
+        gnuplot,
+        "set key off\n"
+    );
+
+    /*
+        Plot:
+
+        column 1 = time
+        column 5 = total acceleration
+    */
+
+    fprintf(
+        gnuplot,
+        "plot '%s' using 1:5 with lines lw 2\n",
+        filename
+    );
+
+    fflush(gnuplot);
+    _pclose(gnuplot);
+
+    return 0;
+}
