@@ -1,0 +1,359 @@
+#include <stdio.h>
+#include <windows.h>
+#include <conio.h>
+
+#define G 9.82
+
+/* Recording length = 20 seconds */
+#define RECORDING_TIME_MS 20000
+
+/* Python Bluetooth receiver */
+#define BLE_COMMAND "py -u ble_receiver.py"
+
+
+int main(void)
+{
+    char line[256];
+
+    unsigned int time_ms;
+    unsigned int start_time_ms = 0;
+
+    int first_measurement = 1;
+    int stopped_early = 0;
+
+    double ax, ay, az;
+    double gx, gy, gz;
+    double a_total;
+
+
+    /* =========================================================
+       DATA FILE
+       ========================================================= */
+
+    char filename[] = "measurements.txt";
+
+    FILE *file = fopen(filename, "w");
+
+    if (file == NULL)
+    {
+        printf("Could not create data file.\n");
+        return 1;
+    }
+
+
+    /* =========================================================
+       START BLUETOOTH RECEIVER
+       ========================================================= */
+
+    printf("\nStarting Bluetooth receiver...\n");
+    printf("Searching for ConcussionHeadband...\n\n");
+
+    FILE *ble = _popen(
+        BLE_COMMAND,
+        "r"
+    );
+
+    if (ble == NULL)
+    {
+        printf("Could not start Bluetooth receiver.\n");
+
+        fclose(file);
+        return 1;
+    }
+
+
+    /* =========================================================
+       START RECORDING
+       ========================================================= */
+
+    printf("Waiting for Bluetooth data...\n");
+    printf("Recording starts with first valid measurement.\n");
+    printf("Recording length: 20 seconds\n");
+    printf("Press Q to stop early.\n\n");
+
+
+    /* =========================================================
+       RECORD DATA
+       ========================================================= */
+
+    while (1)
+    {
+        /* -----------------------------------------------------
+           CHECK FOR Q
+           ----------------------------------------------------- */
+
+        if (kbhit())
+        {
+            char key = getch();
+
+            if (key == 'q' || key == 'Q')
+            {
+                stopped_early = 1;
+                break;
+            }
+        }
+
+
+        /* -----------------------------------------------------
+           READ ONE COMPLETE BLUETOOTH MEASUREMENT
+           ----------------------------------------------------- */
+
+        if (fgets(
+                line,
+                sizeof(line),
+                ble) == NULL)
+        {
+            printf("\nBluetooth connection ended.\n");
+            break;
+        }
+
+
+        /* -----------------------------------------------------
+           PARSE SENSOR DATA
+
+           Expected format:
+
+           time_ms;ax;ay;az;gx;gy;gz;a_total
+           ----------------------------------------------------- */
+
+        int values = sscanf(
+            line,
+            "%u;%lf;%lf;%lf;%lf;%lf;%lf;%lf",
+
+            &time_ms,
+
+            &ax,
+            &ay,
+            &az,
+
+            &gx,
+            &gy,
+            &gz,
+
+            &a_total
+        );
+
+
+        /* -----------------------------------------------------
+           VALID MEASUREMENT
+           ----------------------------------------------------- */
+
+        if (values == 8)
+        {
+            /*
+                First valid measurement becomes time = 0.
+            */
+
+            if (first_measurement)
+            {
+                start_time_ms = time_ms;
+                first_measurement = 0;
+
+                printf("Bluetooth connected.\n");
+                printf("Recording started...\n\n");
+            }
+
+
+            unsigned int elapsed_ms =
+                time_ms - start_time_ms;
+
+
+            double time_seconds =
+                elapsed_ms / 1000.0;
+
+
+            /* -------------------------------------------------
+               STOP AFTER 20 SECONDS
+               ------------------------------------------------- */
+
+            if (elapsed_ms >= RECORDING_TIME_MS)
+            {
+                break;
+            }
+
+
+            /* -------------------------------------------------
+               SAVE DATA
+
+               Column 1 = time
+               Column 2 = X acceleration
+               Column 3 = Y acceleration
+               Column 4 = Z acceleration
+               Column 5 = total acceleration
+
+               Acceleration values saved in g.
+               ------------------------------------------------- */
+
+            fprintf(
+                file,
+                "%.3f %.3f %.3f %.3f %.3f\n",
+
+                time_seconds,
+
+                ax / G,
+                ay / G,
+                az / G,
+
+                a_total / G
+            );
+
+
+            /* -------------------------------------------------
+               TERMINAL DISPLAY
+               ------------------------------------------------- */
+
+            printf(
+                "\rTime: %5.2f / 20.00 s   Total: %6.2f g   ",
+
+                time_seconds,
+                a_total / G
+            );
+        }
+    }
+
+
+    /* =========================================================
+       FINISH RECORDING
+       ========================================================= */
+
+    fflush(file);
+    fclose(file);
+
+    printf("\n\n");
+
+
+    if (stopped_early)
+    {
+        printf("Recording stopped early by user.\n");
+    }
+    else if (!first_measurement)
+    {
+        printf("20 second recording complete.\n");
+    }
+    else
+    {
+        printf("No measurements were recorded.\n");
+    }
+
+
+    printf("Saved as: %s\n", filename);
+
+
+    /* =========================================================
+       STOP BLUETOOTH RECEIVER
+       ========================================================= */
+
+    _pclose(ble);
+
+
+    /*
+        If no measurements were received,
+        there is nothing to plot.
+    */
+
+    if (first_measurement)
+    {
+        return 0;
+    }
+
+
+    /* =========================================================
+       START GNUPLOT
+       ========================================================= */
+
+    printf("\nOpening GNUplot...\n");
+
+
+    FILE *gnuplot = _popen(
+        "gnuplot -persistent",
+        "w"
+    );
+
+
+    if (gnuplot == NULL)
+    {
+        printf("Could not start GNUplot.\n");
+        return 1;
+    }
+
+
+    /* =========================================================
+       GRAPH SETTINGS
+       ========================================================= */
+
+    fprintf(
+        gnuplot,
+        "set title 'X Y Z and Total Acceleration'\n"
+    );
+
+
+    fprintf(
+        gnuplot,
+        "set xlabel 'Time (seconds)'\n"
+    );
+
+
+    fprintf(
+        gnuplot,
+        "set ylabel 'Acceleration (g)'\n"
+    );
+
+
+    fprintf(
+        gnuplot,
+        "set grid\n"
+    );
+
+
+    /*
+        Show legend so we know which colour
+        represents each acceleration value.
+    */
+
+    fprintf(
+        gnuplot,
+        "set key top right\n"
+    );
+
+
+    /* =========================================================
+       ONE GRAPH WITH FOUR LINES
+
+       Column 1 = Time
+
+       Column 2 = X     RED
+       Column 3 = Y     GREEN
+       Column 4 = Z     BLUE
+       Column 5 = Total PURPLE
+       ========================================================= */
+
+    fprintf(
+        gnuplot,
+
+        "plot "
+        "'%s' using 1:2 with lines lw 2 lc rgb 'red' "
+        "title 'X acceleration', "
+
+        "'%s' using 1:3 with lines lw 2 lc rgb 'green' "
+        "title 'Y acceleration', "
+
+        "'%s' using 1:4 with lines lw 2 lc rgb 'blue' "
+        "title 'Z acceleration', "
+
+        "'%s' using 1:5 with lines lw 2 lc rgb 'purple' "
+        "title 'Total acceleration'\n",
+
+        filename,
+        filename,
+        filename,
+        filename
+    );
+
+
+    fflush(gnuplot);
+
+    _pclose(gnuplot);
+
+
+    return 0;
+}
