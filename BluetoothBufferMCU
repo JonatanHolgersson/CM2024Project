@@ -1,0 +1,1315 @@
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/sys/util.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <bluetooth/services/nus.h>
+
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+
+/* ============================================================
+   LED SETTINGS
+   ============================================================ */
+
+#define BLUE_LED 6
+#define GREEN_LED 30
+
+static const struct device *gpio =
+    DEVICE_DT_GET(DT_NODELABEL(gpio0));
+
+
+/* ============================================================
+   IMPACT SETTINGS
+
+   833 Hz:
+   26 / 833 = 31 ms before; 76 / 833 = 91 ms after
+
+   One complete impact:
+   26 before
+   1 trigger
+   76 after
+
+   Total = 103 samples
+   ============================================================ */
+
+#define SAMPLE_RATE_HZ 833U
+
+#define PRE_SAMPLES 26U
+#define POST_SAMPLES 76U
+
+#define SAMPLES_PER_IMPACT \
+    (PRE_SAMPLES + 1U + POST_SAMPLES)
+
+#define GRAVITY_MS2 9.80665
+
+#define IMPACT_THRESHOLD_G 10.0
+
+/*
+ * Do NOT use 100 here anymore.
+ *
+ * Each impact now contains 417 samples,
+ * so 100 impacts would require too much RAM.
+ */
+#define MAX_STORED_IMPACTS 10U
+
+
+/* ============================================================
+   STORED MEASUREMENT
+   ============================================================ */
+
+struct stored_measurement
+{
+    uint32_t time_ms;
+
+    int16_t ax_mg;
+    int16_t ay_mg;
+    int16_t az_mg;
+    int16_t total_mg;
+
+    uint16_t measurement_number;
+};
+
+
+struct impact_record
+{
+    uint32_t impact_number;
+
+    uint16_t sample_count;
+    uint16_t reserved;
+
+    struct stored_measurement samples[SAMPLES_PER_IMPACT];
+};
+
+
+BUILD_ASSERT(
+    sizeof(struct stored_measurement) == 16U,
+    "Unexpected measurement size"
+);
+
+
+/* ============================================================
+   BLUETOOTH CONNECTION
+   ============================================================ */
+
+static volatile bool connected = false;
+static volatile bool notifications_enabled = false;
+
+static struct bt_conn *current_conn = NULL;
+
+
+/* ============================================================
+   BLUETOOTH ADVERTISING
+   ============================================================ */
+
+static const struct bt_data ad[] = {
+
+    BT_DATA_BYTES(
+        BT_DATA_FLAGS,
+        BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR
+    ),
+};
+
+
+static const struct bt_data sd[] = {
+
+    BT_DATA(
+        BT_DATA_NAME_COMPLETE,
+        CONFIG_BT_DEVICE_NAME,
+        sizeof(CONFIG_BT_DEVICE_NAME) - 1
+    ),
+};
+
+
+static int start_advertising(void)
+{
+    return bt_le_adv_start(
+        BT_LE_ADV_PARAM(
+            BT_LE_ADV_OPT_CONN,
+            BT_GAP_ADV_SLOW_INT_MIN,
+            BT_GAP_ADV_SLOW_INT_MAX,
+            NULL
+        ),
+        ad,
+        ARRAY_SIZE(ad),
+        sd,
+        ARRAY_SIZE(sd)
+    );
+}
+
+
+/* ============================================================
+   LED FUNCTIONS
+   ============================================================ */
+
+static void blue_on(void)
+{
+    gpio_pin_set(gpio, BLUE_LED, 0);
+}
+
+
+static void blue_off(void)
+{
+    gpio_pin_set(gpio, BLUE_LED, 1);
+}
+
+
+static void green_on(void)
+{
+    gpio_pin_set(gpio, GREEN_LED, 0);
+}
+
+
+static void green_off(void)
+{
+    gpio_pin_set(gpio, GREEN_LED, 1);
+}
+
+
+/* ============================================================
+   SEND DATA OVER BLUETOOTH
+   ============================================================ */
+
+static int send_data(
+    struct bt_conn *conn,
+    const uint8_t *data,
+    uint16_t length)
+{
+    uint16_t mtu =
+        bt_gatt_get_mtu(conn);
+
+    uint16_t packet_size =
+        mtu - 3U;
+
+    uint16_t sent = 0U;
+
+
+    while (sent < length)
+    {
+        uint16_t size =
+            length - sent;
+
+
+        if (size > packet_size)
+        {
+            size = packet_size;
+        }
+
+
+        int err;
+
+
+        /*
+         * If BLE buffers are full we wait.
+         *
+         * This is OK now because this function is only
+         * called AFTER the complete impact has been sampled.
+         */
+        do
+        {
+            err =
+                bt_nus_send(
+                    conn,
+                    &data[sent],
+                    size
+                );
+
+
+            if (err == -ENOMEM ||
+                err == -EAGAIN)
+            {
+                k_sleep(K_MSEC(2));
+            }
+        }
+        while (
+            (err == -ENOMEM ||
+             err == -EAGAIN) &&
+            connected
+        );
+
+
+        if (err)
+        {
+            return err;
+        }
+
+
+        sent += size;
+    }
+
+
+    return 0;
+}
+
+
+/* ============================================================
+   SEND ONE COMPLETE SAVED IMPACT
+   ============================================================ */
+
+static int send_saved_impact(
+    struct bt_conn *conn,
+    const struct impact_record *impact)
+{
+    char line[128];
+
+    int length;
+    int err;
+
+
+    for (uint16_t i = 0U;
+         i < impact->sample_count;
+         i++)
+    {
+        const struct stored_measurement *measurement =
+            &impact->samples[i];
+
+
+        /*
+         * Bluetooth format:
+         *
+         * impact_number,
+         * time_ms,
+         * ax,
+         * ay,
+         * az,
+         * total
+         */
+
+        length =
+            snprintf(
+                line,
+                sizeof(line),
+
+                "%u,%u,%d,%d,%d,%d\n",
+
+                impact->impact_number,
+                measurement->time_ms,
+
+                measurement->ax_mg,
+                measurement->ay_mg,
+                measurement->az_mg,
+
+                measurement->total_mg
+            );
+
+
+        if (length <= 0 ||
+            length >= (int)sizeof(line))
+        {
+            return -EINVAL;
+        }
+
+
+        err =
+            send_data(
+                conn,
+                (const uint8_t *)line,
+                (uint16_t)length
+            );
+
+
+        if (err)
+        {
+            return err;
+        }
+    }
+
+
+    return 0;
+}
+
+
+/* ============================================================
+   CONVERT TO COMPACT RAM FORMAT
+   ============================================================ */
+
+static int16_t g_to_mg(double value_g)
+{
+    long value_mg =
+        lround(value_g * 1000.0);
+
+
+    if (value_mg > INT16_MAX)
+    {
+        value_mg = INT16_MAX;
+    }
+
+    else if (value_mg < INT16_MIN)
+    {
+        value_mg = INT16_MIN;
+    }
+
+
+    return (int16_t)value_mg;
+}
+
+
+static struct stored_measurement make_stored_measurement(
+    uint32_t time_ms,
+    double ax,
+    double ay,
+    double az,
+    double a_total)
+{
+    struct stored_measurement measurement = {
+
+        .time_ms = time_ms,
+
+        .ax_mg =
+            g_to_mg(ax / GRAVITY_MS2),
+
+        .ay_mg =
+            g_to_mg(ay / GRAVITY_MS2),
+
+        .az_mg =
+            g_to_mg(az / GRAVITY_MS2),
+
+        .total_mg =
+            g_to_mg(a_total / GRAVITY_MS2),
+
+        .measurement_number = 0U,
+    };
+
+
+    return measurement;
+}
+
+
+/* ============================================================
+   BLUETOOTH CONNECTION CALLBACKS
+   ============================================================ */
+
+static void phone_connected(
+    struct bt_conn *conn,
+    uint8_t err)
+{
+    if (err)
+    {
+        return;
+    }
+
+
+    current_conn =
+        bt_conn_ref(conn);
+
+    connected = true;
+
+
+    blue_off();
+    green_on();
+
+
+    printk("Device connected\n");
+}
+
+
+static void phone_disconnected(
+    struct bt_conn *conn,
+    uint8_t reason)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(reason);
+
+
+    connected = false;
+    notifications_enabled = false;
+
+    green_off();
+
+
+    if (current_conn != NULL)
+    {
+        bt_conn_unref(current_conn);
+
+        current_conn = NULL;
+    }
+
+
+    printk("Device disconnected\n");
+}
+
+
+static void connection_recycled(void)
+{
+    int err =
+        start_advertising();
+
+
+    if (err)
+    {
+        printk(
+            "Advertising restart error: %d\n",
+            err
+        );
+    }
+
+    else
+    {
+        printk("Advertising restarted\n");
+    }
+}
+
+
+BT_CONN_CB_DEFINE(connection_callbacks) = {
+
+    .connected =
+        phone_connected,
+
+    .disconnected =
+        phone_disconnected,
+
+    .recycled =
+        connection_recycled,
+};
+
+
+/* ============================================================
+   NORDIC UART RECEIVE CALLBACK
+   ============================================================ */
+
+static void received(
+    struct bt_conn *conn,
+    const uint8_t *const data,
+    uint16_t len)
+{
+    /*
+     * For this sampling test we do NOT echo received
+     * data back over Bluetooth.
+     *
+     * That avoids unnecessary BLE traffic while sampling.
+     */
+
+    ARG_UNUSED(conn);
+    ARG_UNUSED(data);
+    ARG_UNUSED(len);
+}
+
+
+static void nus_send_enabled(enum bt_nus_send_status status)
+{
+    notifications_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
+    printk("BLE notifications: %s\n", notifications_enabled ? "ON" : "OFF");
+}
+
+static struct bt_nus_cb nus_callbacks = {
+    .send_enabled = nus_send_enabled,
+
+    .received =
+        received,
+};
+
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+
+/* Runs in the sensor driver's own thread. Read before IRQ is rearmed. */
+struct ready_sample {
+    struct sensor_value xyz[3];
+    uint32_t time_ms, cycles, sequence;
+};
+K_MSGQ_DEFINE(ready_samples, sizeof(struct ready_sample), 64, 4);
+K_MUTEX_DEFINE(ready_lock);
+static bool capture_enabled;
+static bool polling_mode;
+static const struct i2c_dt_spec imu_bus =
+    I2C_DT_SPEC_GET(DT_COMPAT_GET_ANY_STATUS_OKAY(st_lsm6dsl));
+static uint32_t ready_sequence;
+static struct sensor_trigger ready_trigger = {
+    .type = SENSOR_TRIG_DATA_READY,
+    .chan = SENSOR_CHAN_ACCEL_XYZ,
+};
+static void imu_data_ready(const struct device *dev,
+                           const struct sensor_trigger *trigger)
+{
+    ARG_UNUSED(trigger);
+    struct ready_sample sample;
+    k_mutex_lock(&ready_lock, K_FOREVER);
+    if (polling_mode) {
+        k_mutex_unlock(&ready_lock);
+        return;
+    }
+    sample.cycles = k_cycle_get_32();
+    sample.time_ms = k_uptime_get_32();
+    sample.sequence = ready_sequence++;
+    int rc = sensor_sample_fetch_chan(dev, SENSOR_CHAN_ACCEL_XYZ);
+    if (!rc) rc = sensor_channel_get(dev, SENSOR_CHAN_ACCEL_XYZ, sample.xyz);
+    if (!rc && capture_enabled) {
+        /* Missing sequence numbers expose errors or a full queue. */
+        (void)k_msgq_put(&ready_samples, &sample, K_NO_WAIT);
+    }
+    k_mutex_unlock(&ready_lock);
+}
+static void capture_set(bool enabled)
+{
+    k_mutex_lock(&ready_lock, K_FOREVER);
+    capture_enabled = enabled;
+    k_msgq_purge(&ready_samples);
+    k_mutex_unlock(&ready_lock);
+}
+
+int main(void)
+{
+    int err;
+
+
+    /* ========================================================
+       GPIO
+       ======================================================== */
+
+    if (!device_is_ready(gpio))
+    {
+        printk("GPIO not ready.\n");
+
+        return 0;
+    }
+
+
+    gpio_pin_configure(
+        gpio,
+        BLUE_LED,
+        GPIO_OUTPUT_HIGH
+    );
+
+
+    gpio_pin_configure(
+        gpio,
+        GREEN_LED,
+        GPIO_OUTPUT_HIGH
+    );
+
+
+    blue_off();
+    green_off();
+
+
+    /* ========================================================
+       GET IMU
+       ======================================================== */
+
+    const struct device *imu =
+        DEVICE_DT_GET_ONE(st_lsm6dsl);
+
+
+    if (!device_is_ready(imu))
+    {
+        printk("LSM6DSL is not ready.\n");
+
+        return 0;
+    }
+
+
+    printk("LSM6DSL ready.\n");
+
+
+    /* ========================================================
+       ACCELEROMETER RANGE = +/-16 g
+       ======================================================== */
+
+    struct sensor_value accel_range;
+
+
+    sensor_g_to_ms2(
+        16,
+        &accel_range
+    );
+
+
+    if (sensor_attr_set(
+            imu,
+            SENSOR_CHAN_ACCEL_XYZ,
+            SENSOR_ATTR_FULL_SCALE,
+            &accel_range) < 0)
+    {
+        printk(
+            "Could not set accelerometer to +/-16 g.\n"
+        );
+
+        return 0;
+    }
+
+
+    /* ========================================================
+       ACCELEROMETER = 833 Hz
+       ======================================================== */
+
+    struct sensor_value accel_frequency;
+
+
+    accel_frequency.val1 =
+        SAMPLE_RATE_HZ;
+
+    accel_frequency.val2 = 0;
+
+
+    if (sensor_attr_set(
+            imu,
+            SENSOR_CHAN_ACCEL_XYZ,
+            SENSOR_ATTR_SAMPLING_FREQUENCY,
+            &accel_frequency) < 0)
+    {
+        printk(
+            "Could not set accelerometer frequency.\n"
+        );
+
+        return 0;
+    }
+
+
+    /* ========================================================
+       GYROSCOPE DISABLED
+       ======================================================== */
+
+    struct sensor_value gyro_frequency;
+
+
+    gyro_frequency.val1 = 0; /* Gyro off: accel-only DATA_READY. */
+
+    gyro_frequency.val2 = 0;
+
+
+    if (sensor_attr_set(
+            imu,
+            SENSOR_CHAN_GYRO_XYZ,
+            SENSOR_ATTR_SAMPLING_FREQUENCY,
+            &gyro_frequency) < 0)
+    {
+        printk(
+            "Could not set gyroscope frequency.\n"
+        );
+
+        return 0;
+    }
+
+
+    printk("Accelerometer: +/-16 g\n");
+
+    printk(
+        "Sampling frequency: %u Hz\n",
+        SAMPLE_RATE_HZ
+    );
+
+    printk(
+        "Samples per impact: %u\n",
+        SAMPLES_PER_IMPACT
+    );
+
+
+    /* ========================================================
+       START BLUETOOTH
+       ======================================================== */
+
+    err =
+        bt_enable(NULL);
+
+
+    if (err)
+    {
+        printk(
+            "Bluetooth error: %d\n",
+            err
+        );
+
+        return 0;
+    }
+
+
+    printk("Bluetooth ready.\n");
+
+
+    /* ========================================================
+       START NUS
+       ======================================================== */
+
+    err =
+        bt_nus_init(
+            &nus_callbacks
+        );
+
+
+    if (err)
+    {
+        printk(
+            "NUS error: %d\n",
+            err
+        );
+
+        return 0;
+    }
+
+
+    /* ========================================================
+       START ADVERTISING
+       ======================================================== */
+
+    err =
+        start_advertising();
+
+
+    if (err)
+    {
+        printk(
+            "Advertising error: %d\n",
+            err
+        );
+
+        return 0;
+    }
+
+
+    printk(
+        "Advertising as ConcussionHeadband\n"
+    );
+
+    printk(
+        "Starting measurements...\n"
+    );
+
+    printk(
+        "Stores up to %u impacts in RAM.\n",
+        MAX_STORED_IMPACTS
+    );
+
+
+    /* ========================================================
+       LED VARIABLES
+       ======================================================== */
+
+    uint32_t last_blink_time = 0U;
+
+    bool blue_state = false;
+
+
+    /* ========================================================
+       PRE-IMPACT RING BUFFER
+       ======================================================== */
+
+    static struct stored_measurement
+        history[PRE_SAMPLES];
+
+
+    uint16_t history_write_position = 0U;
+
+    uint16_t history_count = 0U;
+
+
+    /* ========================================================
+       ACTIVE IMPACT
+       ======================================================== */
+
+    static struct impact_record
+        active_impact;
+
+
+    uint16_t after_samples_collected = 0U;
+
+    bool collecting_impact = false;
+
+    bool was_above_threshold = false;
+
+    uint32_t next_impact_number = 1U;
+
+
+    /* ========================================================
+       COMPLETE IMPACT QUEUE
+       ======================================================== */
+
+    static struct impact_record
+        impact_queue[MAX_STORED_IMPACTS];
+
+
+    uint16_t queue_head = 0U;
+
+    uint16_t queue_tail = 0U;
+
+    uint16_t queue_count = 0U;
+
+    bool queue_full_message_printed = false;
+
+
+    /* ========================================================
+       MAIN MEASUREMENT LOOP
+       ======================================================== */
+
+
+    uint32_t previous_cycles = 0, previous_sequence = 0, timing_gaps = 0;
+    uint32_t status_time = k_uptime_get_32(), status_samples = 0;
+    uint32_t aborted_impacts = 0, status_peak_mg = 0;
+    bool have_previous = false;
+    err = sensor_sample_fetch(imu); /* Clear stale accel/gyro data. */
+    if (err) { printk("Initial fetch: %d\n", err); return 0; }
+    capture_set(true);
+    err = sensor_trigger_set(imu, &ready_trigger, imu_data_ready);
+    if (err) { printk("DATA_READY setup: %d\n", err); return 0; }
+    while (1)
+    {
+
+        /* LED updates must also run when the sensor produces no samples. */
+        uint32_t led_now = k_uptime_get_32();
+        if (!connected && (uint32_t)(led_now - last_blink_time) >= 500U) {
+            last_blink_time = led_now;
+            blue_state = !blue_state;
+            gpio_pin_set(gpio, BLUE_LED, blue_state ? 0 : 1);
+        }
+
+        struct ready_sample sample;
+        if (polling_mode) {
+            /* STATUS_REG.XLDA is hardware data-ready, independent of INT1.
+             * This fallback is diagnostic, not a lossless 833 Hz guarantee.
+             */
+            uint8_t status;
+            int rc = i2c_reg_read_byte_dt(&imu_bus, 0x1e, &status);
+            if (rc) {
+                printk("IMU STATUS read failed: %d\n", rc);
+                k_sleep(K_MSEC(100));
+                continue;
+            }
+            if (!(status & BIT(0))) {
+                k_sleep(K_USEC(100));
+                continue;
+            }
+            sample.cycles = k_cycle_get_32();
+            sample.time_ms = k_uptime_get_32();
+            sample.sequence = ready_sequence++;
+            rc = sensor_sample_fetch_chan(imu, SENSOR_CHAN_ACCEL_XYZ);
+            if (!rc) rc = sensor_channel_get(imu, SENSOR_CHAN_ACCEL_XYZ, sample.xyz);
+            if (rc) {
+                printk("IMU fetch failed: %d\n", rc);
+                k_sleep(K_MSEC(100));
+                continue;
+            }
+        } else if (k_msgq_get(&ready_samples, &sample, K_MSEC(500))) {
+            uint8_t ctrl = 0, status = 0, int1 = 0;
+            k_mutex_lock(&ready_lock, K_FOREVER);
+            polling_mode = true;
+            k_msgq_purge(&ready_samples);
+            int r1 = i2c_reg_read_byte_dt(&imu_bus, 0x10, &ctrl);
+            int r2 = i2c_reg_read_byte_dt(&imu_bus, 0x1e, &status);
+            int r3 = i2c_reg_read_byte_dt(&imu_bus, 0x0d, &int1);
+            k_mutex_unlock(&ready_lock);
+            sensor_trigger_set(imu, &ready_trigger, NULL);
+            printk("IRQ stalled. CTRL1_XL=%02x STATUS=%02x INT1_CTRL=%02x errors=%d,%d,%d\n",
+                   ctrl, status, int1, r1, r2, r3);
+            printk("Fallback: reading hardware XLDA flag; verify measured rate.\n");
+            history_count = 0;
+            collecting_impact = false;
+            was_above_threshold = false;
+            have_previous = false;
+            continue;
+        }
+        uint32_t time_ms = sample.time_ms;
+        uint32_t dt_us = have_previous
+            ? k_cyc_to_us_floor32(sample.cycles - previous_cycles) : 0;
+        bool gap = have_previous &&
+            sample.sequence != previous_sequence + 1U;
+        /* Callback timing is not a hardware sample timestamp.
+         * Flag late callbacks, but do not silently discard every impact.
+         * A zero sequence-loss count does NOT prove lossless acquisition.
+         */
+        if (have_previous && dt_us > 2000U) timing_gaps++;
+        previous_cycles = sample.cycles;
+        previous_sequence = sample.sequence;
+        have_previous = true;
+        if (gap) {
+            /* A fetch failure or queue overflow is a known software gap. */
+            if (collecting_impact) aborted_impacts++;
+            history_count = 0;
+            collecting_impact = false;
+            was_above_threshold = false;
+        }
+        double ax = sensor_value_to_double(&sample.xyz[0]);
+        double ay = sensor_value_to_double(&sample.xyz[1]);
+        double az = sensor_value_to_double(&sample.xyz[2]);
+        double a_total = sqrt(ax * ax + ay * ay + az * az);
+        double a_total_g = a_total / GRAVITY_MS2;
+        struct stored_measurement current_measurement =
+            make_stored_measurement(time_ms, ax, ay, az, a_total);
+        status_samples++;
+        if ((uint32_t)current_measurement.total_mg > status_peak_mg)
+            status_peak_mg = (uint32_t)current_measurement.total_mg;
+        if ((uint32_t)(k_uptime_get_32() - status_time) >= 2000U &&
+            !collecting_impact) {
+            printk("STATUS samples=%u elapsed_ms=%u peak_mg=%u history=%u queue=%u notify=%u late=%u aborted=%u\n",
+                   status_samples, (uint32_t)(k_uptime_get_32() - status_time),
+                   status_peak_mg, history_count, queue_count,
+                   notifications_enabled, timing_gaps, aborted_impacts);
+            status_time = k_uptime_get_32();
+            status_samples = 0;
+            status_peak_mg = 0;
+        }
+
+        /* ====================================================
+           COLLECT POST-IMPACT SAMPLES
+           ==================================================== */
+
+        if (collecting_impact)
+        {
+            uint16_t position =
+                PRE_SAMPLES +
+                1U +
+                after_samples_collected;
+
+
+            current_measurement
+                .measurement_number =
+                    position;
+
+
+            active_impact
+                .samples[position] =
+                    current_measurement;
+
+
+            after_samples_collected++;
+
+
+            /*
+             * Entire impact is now complete.
+             */
+
+            if (after_samples_collected >=
+                POST_SAMPLES)
+            {
+                active_impact.sample_count =
+                    SAMPLES_PER_IMPACT;
+
+
+                /*
+                 * Move completed impact into RAM queue.
+                 */
+
+                impact_queue[queue_tail] =
+                    active_impact;
+
+
+                queue_tail =
+                    (queue_tail + 1U) %
+                    MAX_STORED_IMPACTS;
+
+
+                queue_count++;
+
+
+                collecting_impact =
+                    false;
+
+
+                printk(
+                    "Impact %u complete. "
+                    "%u samples saved in RAM.\n",
+
+                    active_impact
+                        .impact_number,
+
+                    active_impact
+                        .sample_count
+                );
+            }
+        }
+
+
+        /* ====================================================
+           IMPACT DETECTION
+           ==================================================== */
+
+        bool above_threshold =
+            a_total_g >=
+            IMPACT_THRESHOLD_G;
+
+
+        /*
+         * Start one new impact when threshold is crossed.
+         */
+
+        if (!collecting_impact &&
+            above_threshold &&
+            !was_above_threshold &&
+            history_count ==
+                PRE_SAMPLES)
+        {
+            if (queue_count <
+                MAX_STORED_IMPACTS)
+            {
+                active_impact
+                    .impact_number =
+                        next_impact_number++;
+
+
+                active_impact
+                    .sample_count = 0U;
+
+
+                active_impact
+                    .reserved = 0U;
+
+
+                /*
+                 * Copy PRE_SAMPLES measurements BEFORE impact
+                 * from ring buffer.
+                 */
+
+                for (
+                    uint16_t i = 0U;
+                    i < PRE_SAMPLES;
+                    i++
+                )
+                {
+                    uint16_t
+                        history_position =
+
+                        (
+                            history_write_position +
+                            i
+                        ) %
+                        PRE_SAMPLES;
+
+
+                    active_impact.samples[i] =
+                        history[
+                            history_position
+                        ];
+
+
+                    active_impact
+                        .samples[i]
+                        .measurement_number =
+                            i;
+                }
+
+
+                /*
+                 * Store trigger sample.
+                 */
+
+                current_measurement
+                    .measurement_number =
+                        PRE_SAMPLES;
+
+
+                active_impact
+                    .samples[PRE_SAMPLES] =
+                        current_measurement;
+
+
+                collecting_impact =
+                    true;
+
+
+                after_samples_collected =
+                    0U;
+
+
+                /* No floating-point printing during capture. */
+            }
+
+            else if (
+                !queue_full_message_printed
+            )
+            {
+                printk(
+                    "RAM queue full. "
+                    "New impacts are not stored.\n"
+                );
+
+
+                queue_full_message_printed =
+                    true;
+            }
+        }
+
+
+        was_above_threshold =
+            above_threshold;
+
+
+        /* ====================================================
+           UPDATE PRE-IMPACT RING BUFFER
+           ==================================================== */
+
+        history[
+            history_write_position
+        ] =
+            current_measurement;
+
+
+        history_write_position =
+            (
+                history_write_position +
+                1U
+            ) %
+            PRE_SAMPLES;
+
+
+        if (history_count <
+            PRE_SAMPLES)
+        {
+            history_count++;
+        }
+
+
+        /* ====================================================
+           SEND COMPLETE IMPACT OVER BLUETOOTH
+
+           IMPORTANT:
+
+           No live samples are sent.
+
+           We only enter this block after the complete
+           pre + trigger + post impact has been stored.
+           ==================================================== */
+
+        if (!collecting_impact &&
+            connected &&
+            notifications_enabled &&
+            current_conn != NULL &&
+            queue_count > 0U)
+        {
+            capture_set(false);
+            struct bt_conn *upload_conn =
+                bt_conn_ref(
+                    current_conn
+                );
+
+
+            printk(
+                "Uploading %u complete impact(s). "
+                "Sampling paused.\n",
+
+                queue_count
+            );
+
+
+            while (
+                connected &&
+                queue_count > 0U
+            )
+            {
+                err =
+                    send_saved_impact(
+                        upload_conn,
+
+                        &impact_queue[
+                            queue_head
+                        ]
+                    );
+
+
+                if (err)
+                {
+                    printk(
+                        "Upload stopped "
+                        "with error %d.\n",
+
+                        err
+                    );
+
+
+                    break;
+                }
+
+
+                printk(
+                    "Impact %u sent.\n",
+
+                    impact_queue[
+                        queue_head
+                    ]
+                    .impact_number
+                );
+
+
+                queue_head =
+                    (
+                        queue_head +
+                        1U
+                    ) %
+                    MAX_STORED_IMPACTS;
+
+
+                queue_count--;
+
+
+                queue_full_message_printed =
+                    false;
+            }
+
+
+            bt_conn_unref(
+                upload_conn
+            );
+
+
+
+            history_count = 0;
+            history_write_position = 0;
+            was_above_threshold = false;
+            have_previous = false;
+            printk("Late callbacks (>2 ms), not proven sample losses: %u\n", timing_gaps);
+            capture_set(true);
+            printk(
+                "Upload finished. "
+                "Sampling resumes.\n"
+            );
+        }
+
+
+        /* ====================================================
+           LED CONTROL
+           ==================================================== */
+
+        if (!connected)
+        {
+            green_off();
+
+
+            if (
+                (time_ms -
+                 last_blink_time)
+                >= 500U
+            )
+            {
+                last_blink_time =
+                    time_ms;
+
+
+                blue_state =
+                    !blue_state;
+
+
+                if (blue_state)
+                {
+                    blue_on();
+                }
+
+                else
+                {
+                    blue_off();
+                }
+            }
+        }
+
+        else
+        {
+            blue_off();
+
+            green_on();
+        }
+
+
+        /* Wait for next DATA_READY sample in the next iteration. */
+    }
+
+
+    return 0;
+}
